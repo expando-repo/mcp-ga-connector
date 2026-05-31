@@ -3,17 +3,20 @@ MCP SSE endpoint - hlavní vstupní bod pro Claude.ai
 Implementuje Model Context Protocol přes Server-Sent Events (SSE)
 
 Protokol:
-1. Claude se připojí na GET /sse?session_id=...
-2. Server streamuje SSE zprávy
-3. Claude posílá POST /message?session_id=... s JSON-RPC požadavky
+1. Claude se připojí na GET /sse (bez parametrů nebo s session_id)
+2. Server automaticky vygeneruje session_id pokud chybí
+3. Pokud uživatel není přihlášený, přesměruje na /auth/login
+4. Server streamuje SSE zprávy
+5. Claude posílá POST /message?session_id=... s JSON-RPC požadavky
 """
 import json
 import logging
 import asyncio
-from typing import AsyncGenerator
+import uuid
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Request, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -65,12 +68,27 @@ async def sse_generator(session_id: str, queue: asyncio.Queue) -> AsyncGenerator
 
 
 @router.get("/sse")
-async def sse_endpoint(request: Request, session_id: str, db: AsyncSession = Depends(get_db)):
+async def sse_endpoint(
+    request: Request,
+    session_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Hlavní SSE endpoint. Claude.ai se sem připojí jako MCP klient.
-    URL: https://vasa-domena.cz/sse?session_id=<id>
+    
+    Bez parametrů: https://mcp-ga-connector.locoglobal.ai/sse
+    S session_id: https://mcp-ga-connector.locoglobal.ai/sse?session_id=...
+    
+    Pokud session_id chybí → vygeneruj nový
+    Pokud uživatel není přihlášený → přesměruj na OAuth login
     """
-    # Ověř, že session má platný token
+    
+    # Vygeneruj session_id pokud chybí
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        logger.info(f"✅ Auto-generovaný nový session_id: {session_id[:8]}...")
+    
+    # Ověř, že session má platný OAuth token
     result = await db.execute(
         select(OAuthToken).where(
             OAuthToken.session_id == session_id,
@@ -79,12 +97,30 @@ async def sse_endpoint(request: Request, session_id: str, db: AsyncSession = Dep
     )
     token = result.scalar_one_or_none()
 
+    # Pokud není přihlášený → přesměruj na OAuth login
     if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Nepřihlášen. Nejdřív proveď Google OAuth přihlášení.",
-        )
+        login_url = f"{settings.base_url}/auth/login?session_id={session_id}"
+        logger.info(f"Session {session_id[:8]}... není přihlášená, přesměrování na OAuth login")
+        
+        # Vrať HTML stránku s instrukci + auto-redirect
+        html = f"""
+        <html>
+        <head>
+            <title>MCP GA Connector - OAuth Login</title>
+        </head>
+        <body>
+            <h2>Autentizace</h2>
+            <p>Probíhá přihlašování skrz Google...</p>
+            <p><a href="{login_url}">Klikni sem pokud se automaticky nepřesměrovalo</a></p>
+            <script>
+                window.location.href = "{login_url}";
+            </script>
+        </body>
+        </html>
+        """
+        return RedirectResponse(url=login_url)
 
+    # Máme platný token → zapoj SSE stream
     queue = get_or_create_queue(session_id)
 
     return StreamingResponse(
@@ -135,7 +171,7 @@ async def message_endpoint(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name": settings.mcp_server_name,
+                    "name": "google-analytics",
                     "version": "1.0.0",
                 },
             },
