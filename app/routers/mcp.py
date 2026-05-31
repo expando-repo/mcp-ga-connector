@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.database import get_db, OAuthToken
-from app.tools.ga_tools import handle_tool_call, get_tools_definition
+from app.tools import handle_tool_call, get_tools_definition
 from app.config import settings
 
 logger = logging.getLogger(__name__)
