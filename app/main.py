@@ -80,3 +80,73 @@ async def init_session():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---- OAuth 2.0 Discovery Endpoints ----
+# Claude hledá tyto endpointy pro automatickou konfiguraci OAuth
+
+@app.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource():
+    """
+    OpenID Connect metadata endpoint
+    https://tools.ietf.org/html/rfc8414
+    """
+    return JSONResponse({
+        "issuer": settings.base_url,
+        "authorization_endpoint": f"{settings.base_url}/auth/login",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "userinfo_endpoint": "https://www.googleapis.com/oauth2/v2/userinfo",
+        "jwks_uri": "https://www.googleapis.com/oauth2/v1/certs",
+        "scopes_supported": [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/analytics.readonly",
+        ],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+    })
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_authorization_server():
+    """
+    OAuth 2.0 Authorization Server Metadata endpoint
+    https://tools.ietf.org/html/rfc8414
+    """
+    return JSONResponse({
+        "issuer": settings.base_url,
+        "authorization_endpoint": f"{settings.base_url}/auth/login",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "userinfo_endpoint": "https://www.googleapis.com/oauth2/v2/userinfo",
+        "jwks_uri": "https://www.googleapis.com/oauth2/v1/certs",
+        "scopes_supported": [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/analytics.readonly",
+        ],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+    })
+
+
+@app.post("/register")
+async def oauth_register(request: Request):
+    """
+    OAuth 2.0 Dynamic Client Registration endpoint
+    Claude.ai se může chtít zaregistrovat dynamicky
+    """
+    try:
+        body = await request.json()
+        # V našem případě vrátíme, že se musí přihlásit normálně
+        return JSONResponse({
+            "error": "unsupported_operation",
+            "error_description": "Dynamická registrace není podporována. Použij /auth/login"
+        }, status_code=400)
+    except:
+        return JSONResponse({
+            "error": "invalid_request",
+            "error_description": "Neplatný request"
+        }, status_code=400)
