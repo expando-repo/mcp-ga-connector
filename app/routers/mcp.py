@@ -1,53 +1,59 @@
 """
-MCP SSE endpoint - hlavní vstupní bod pro Claude.ai
-Implementuje Model Context Protocol přes Server-Sent Events (SSE)
-
-Protokol:
-1. Claude se připojí na GET /sse (bez parametrů nebo s session_id)
-2. Server automaticky vygeneruje session_id pokud chybí
-3. Pokud uživatel není přihlášený, přesměruje na /auth/login
-4. Server streamuje SSE zprávy
-5. Claude posílá POST /message?session_id=... s JSON-RPC požadavky
+MCP (Model Context Protocol) routes pro SSE stream a message handling.
 """
+import asyncio
 import json
 import logging
-import asyncio
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Dict, Any
+from datetime import datetime
 
-from fastapi import APIRouter, Request, Depends, HTTPException
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.db.database import get_db, OAuthToken
-from app.tools import handle_tool_call, get_tools_definition
 from app.config import settings
+from app.db.database import get_db, OAuthToken
+from app.tools import get_tools_definition, handle_tool_call
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# In-memory fronta zpráv per session
-# V produkci lze nahradit Redis pub/sub
-_message_queues: dict[str, asyncio.Queue] = {}
+# In-memory message queues per session
+_message_queues: Dict[str, asyncio.Queue] = {}
 
 
-def get_or_create_queue(session_id: str) -> asyncio.Queue:
+async def get_or_create_queue(session_id: str) -> asyncio.Queue:
+    """Vrátí existující queue nebo vytvoří novu."""
     if session_id not in _message_queues:
         _message_queues[session_id] = asyncio.Queue()
     return _message_queues[session_id]
 
 
-async def sse_generator(session_id: str, queue: asyncio.Queue) -> AsyncGenerator[str, None]:
+async def sse_generator(session_id: str, queue: asyncio.Queue, email: str) -> AsyncGenerator[str, None]:
     """Generuje SSE stream pro danou session."""
 
-    # Poslat inicializační zprávu (MCP handshake)
+    # 1. Poslat inicializační zprávu (MCP handshake)
     init_msg = {
         "jsonrpc": "2.0",
         "method": "connection/established",
         "params": {"sessionId": session_id},
     }
     yield f"data: {json.dumps(init_msg)}\n\n"
+    logger.info(f"✅ MCP connection established pro session {session_id[:8]}...")
+
+    # 2. Poslat seznam nástrojů
+    tools_list = get_tools_definition()
+    tools_msg = {
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "params": {
+            "tools": tools_list,
+        },
+    }
+    yield f"data: {json.dumps(tools_msg)}\n\n"
+    logger.info(f"✅ Tools list sent: {len(tools_list)} nástrojů")
 
     try:
         while True:
@@ -99,36 +105,22 @@ async def sse_endpoint(
 
     # Pokud není přihlášený → přesměruj na OAuth login
     if not token:
-        login_url = f"{settings.base_url}/auth/login?session_id={session_id}"
         logger.info(f"Session {session_id[:8]}... není přihlášená, přesměrování na OAuth login")
-        
-        # Vrať HTML stránku s instrukci + auto-redirect
-        html = f"""
-        <html>
-        <head>
-            <title>MCP GA Connector - OAuth Login</title>
-        </head>
-        <body>
-            <h2>Autentizace</h2>
-            <p>Probíhá přihlašování skrz Google...</p>
-            <p><a href="{login_url}">Klikni sem pokud se automaticky nepřesměrovalo</a></p>
-            <script>
-                window.location.href = "{login_url}";
-            </script>
-        </body>
-        </html>
-        """
-        return RedirectResponse(url=login_url)
+        from fastapi.responses import RedirectResponse
+        redirect_url = f"{settings.base_url}/auth/login?session_id={session_id}"
+        return RedirectResponse(redirect_url)
 
-    # Máme platný token → zapoj SSE stream
-    queue = get_or_create_queue(session_id)
+    logger.info(f"✅ SSE stream otevřen pro session {session_id[:8]}... (email: {token.google_email})")
+
+    # Vytvoř queue pro tuto session
+    queue = await get_or_create_queue(session_id)
 
     return StreamingResponse(
-        sse_generator(session_id, queue),
+        sse_generator(session_id, queue, token.google_email),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Nginx: vypni buffering
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
@@ -141,95 +133,65 @@ async def message_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Claude.ai sem posílá JSON-RPC požadavky (tool calls, ping, atd.)
+    Přijímá JSON-RPC zprávu od Claude.ai a zpracovává ji.
+    Claude.ai POST-uje sem s tool call requestem.
     """
-    body = await request.json()
-    method = body.get("method", "")
-    msg_id = body.get("id")
+    try:
+        body = await request.json()
+    except Exception as e:
+        return {"error": f"Neplatný JSON: {str(e)}"}
 
-    # Načti credentials pro tuto session
+    # Ověř session
     result = await db.execute(
         select(OAuthToken).where(
             OAuthToken.session_id == session_id,
             OAuthToken.is_active == True,
         )
     )
-    token_row = result.scalar_one_or_none()
+    token = result.scalar_one_or_none()
 
-    if not token_row:
-        return _error_response(msg_id, -32001, "Nepřihlášen")
+    if not token:
+        return {"error": "Session není přihlášená"}
 
-    queue = get_or_create_queue(session_id)
+    logger.info(f"📨 Message z Claude: {body.get('method', 'unknown')}")
 
-    # ---- JSON-RPC dispatch ----
-
-    if method == "initialize":
-        response = {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "google-analytics",
-                    "version": "1.0.0",
-                },
-            },
-        }
-        await queue.put(response)
-        return {"ok": True}
-
-    elif method == "tools/list":
-        response = {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {"tools": get_tools_definition()},
-        }
-        await queue.put(response)
-        return {"ok": True}
-
-    elif method == "tools/call":
+    # Zpracuj zprávu
+    if body.get("method") == "tools/call":
         tool_name = body.get("params", {}).get("name")
         tool_args = body.get("params", {}).get("arguments", {})
 
+        logger.info(f"🔧 Tool call: {tool_name} se argumenty: {tool_args}")
+
+        # Zavolej handler
         try:
-            credentials_dict = token_row.get_credentials_dict()
-            result_content = await handle_tool_call(tool_name, tool_args, credentials_dict)
+            result = await handle_tool_call(
+                tool_name=tool_name,
+                arguments=tool_args,
+                session_id=session_id,
+                google_email=token.google_email,
+                access_token=token.access_token,
+            )
+
             response = {
                 "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps(result_content, ensure_ascii=False)}],
-                    "isError": False,
-                },
+                "id": body.get("id"),
+                "result": result,
             }
         except Exception as e:
-            logger.error(f"Tool call error: {e}")
+            logger.error(f"❌ Tool call failed: {e}")
             response = {
                 "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [{"type": "text", "text": f"Chyba: {str(e)}"}],
-                    "isError": True,
+                "id": body.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": str(e),
                 },
             }
 
+        # Pošli response zpět do SSE stream
+        queue = await get_or_create_queue(session_id)
         await queue.put(response)
-        return {"ok": True}
 
-    elif method == "ping":
-        await queue.put({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-        return {"ok": True}
+        return response
 
-    else:
-        err = _error_response(msg_id, -32601, f"Neznámá metoda: {method}")
-        await queue.put(err)
-        return {"ok": True}
-
-
-def _error_response(msg_id, code: int, message: str) -> dict:
-    return {
-        "jsonrpc": "2.0",
-        "id": msg_id,
-        "error": {"code": code, "message": message},
-    }
+    return {"error": f"Neznámá metoda: {body.get('method')}"}
