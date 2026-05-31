@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.database import init_db, get_db
@@ -52,9 +52,29 @@ async def root():
     return """
     <html><body>
     <h2>MCP Google Analytics Connector</h2>
-    <p>Server běží. Pro připojení přes Claude.ai použij MCP URL: <code>/sse</code></p>
+    <p>Server běží. Pro připojení přes Claude.ai:</p>
+    <ol>
+        <li>Navštiv: <a href="/init">/init</a> - vygeneruje session_id a MCP URL</li>
+        <li>Nebo použij: <code>/sse?session_id=UNIQUE_ID</code> s vlastním session_id</li>
+    </ol>
     </body></html>
     """
+
+
+@app.get("/init")
+async def init_session():
+    """
+    Vygeneruje nový session_id a vrátí připravenou URL pro Claude.ai
+    Klient zavolá tento endpoint a dostane JSON s připravenou MCP URL.
+    """
+    session_id = str(uuid.uuid4())
+    mcp_url = f"{settings.base_url}/sse?session_id={session_id}"
+    
+    return JSONResponse({
+        "session_id": session_id,
+        "mcp_url": mcp_url,
+        "instructions": f"Zkopíruj tuto URL do Claude.ai MCP connectoru: {mcp_url}"
+    })
 
 
 @app.get("/health")
