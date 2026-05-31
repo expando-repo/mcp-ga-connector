@@ -18,6 +18,7 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request as GoogleRequest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
+import jwt
 
 from app.config import settings
 from app.db.database import get_db, OAuthToken, OAuthState
@@ -85,9 +86,8 @@ async def login(
         logger.info(f"Claude OAuth flow: vygenerován session_id={session_id[:8]}... ze state={state[:8]}...")
         
         # Ulož mapping: Claude's state → naše session_id
-        # Budeme si pamatovat Claude's original state, aby se při callbacku sladilo
         oauth_state = OAuthState(
-            state=state,  # Claude's original state
+            state=state,
             session_id=session_id
         )
         db.add(oauth_state)
@@ -102,7 +102,7 @@ async def login(
     # Pokud je Claude OAuth, pošli Claude's state do Google aby nám ho vrátil v callbacku
     if is_claude_oauth:
         auth_url, _ = flow.authorization_url(
-            state=state,  # Pošli Claude's state dál Googlu — on nám ho vrátí
+            state=state,
             access_type="offline",
             include_granted_scopes="true",
             prompt="consent",
@@ -154,12 +154,25 @@ async def callback(
         raise HTTPException(status_code=400, detail=f"Token exchange selhalo: {str(e)}")
 
     creds = flow.credentials
-    logger.info(f"✅ Google OAuth úspěšný pro session_id={session_id[:8]}...")
+    
+    # Dekóduj ID token (je to JWT string)
+    google_email = "unknown"
+    try:
+        if creds.id_token:
+            # ID token je JWT string, dekóduj ho
+            # Bez ověření signature (protože máme validní token z Google)
+            id_token_decoded = jwt.decode(creds.id_token, options={"verify_signature": False})
+            google_email = id_token_decoded.get("email", "unknown")
+            logger.info(f"Email z ID token: {google_email}")
+    except Exception as e:
+        logger.warning(f"Nemůžu dekódovat ID token: {e}")
+    
+    logger.info(f"✅ Google OAuth úspěšný pro session_id={session_id[:8]}... (email: {google_email})")
 
     # Ulož token do DB
     token_row = OAuthToken(
         session_id=session_id,
-        google_email=creds.id_token.get("email", "unknown") if creds.id_token else "unknown",
+        google_email=google_email,
         access_token=creds.token,
         refresh_token=creds.refresh_token,
         token_expiry=creds.expiry,
