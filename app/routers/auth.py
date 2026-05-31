@@ -1,9 +1,5 @@
 """
-Google OAuth 2.0 flow
-- /auth/login?session_id=... nebo Claude OAuth params → přesměruje na Google
-- /auth/callback            → zpracuje token, uloží do DB
-- /auth/status?session_id=  → zjistí stav přihlášení
-- /auth/disconnect          → smaže token
+Google OAuth 2.0 flow + Claude.ai MCP integration
 """
 import json
 import secrets
@@ -160,7 +156,6 @@ async def callback(
     try:
         if creds.id_token:
             # ID token je JWT string, dekóduj ho
-            # Bez ověření signature (protože máme validní token z Google)
             id_token_decoded = jwt.decode(creds.id_token, options={"verify_signature": False})
             google_email = id_token_decoded.get("email", "unknown")
             logger.info(f"Email z ID token: {google_email}")
@@ -181,10 +176,44 @@ async def callback(
     db.add(token_row)
     await db.commit()
 
-    # Přesměruj zpět na /sse s session_id
-    redirect_url = f"{settings.base_url}/sse?session_id={session_id}"
-    logger.info(f"OAuth callback complete, redirecting to: {redirect_url}")
-    return RedirectResponse(redirect_url)
+    # Vytvoř MCP URI
+    mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
+    logger.info(f"MCP URI: {mcp_uri}")
+
+    # Vrať HTML stránku, která informuje Claude o MCP URI
+    # Claude.ai MCP klient sám si vezme mcp_uri z query parametru
+    html_content = f"""
+    <html>
+    <head>
+        <title>MCP GA Connector - OAuth Success</title>
+    </head>
+    <body>
+        <h1>✅ OAuth Success!</h1>
+        <p>User: {google_email}</p>
+        <p>Session: {session_id}</p>
+        
+        <p>Pokud jsi v Claude.ai, měl by se connector automaticky připojit.</p>
+        <p>Pokud ne, zkopíruj tuto MCP URI do nastavení claude.ai:</p>
+        <pre>{mcp_uri}</pre>
+        
+        <script>
+        // Pokud je to v iframeu z Claude.ai, pošli mcp_uri zpět
+        if (window.opener || window.parent !== window) {{
+            try {{
+                window.parent.postMessage({{
+                    type: 'mcp_uri',
+                    mcp_uri: '{mcp_uri}'
+                }}, '*');
+            }} catch (e) {{
+                console.log('Could not post message to parent');
+            }}
+        }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(html_content)
 
 
 @router.get("/status")
