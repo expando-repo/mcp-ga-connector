@@ -1,0 +1,17 @@
+[Unit]
+Description=MCP Google Analytics Connector
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=mcpuser
+WorkingDirectory=/opt/mcp-ga-connector
+EnvironmentFile=/opt/mcp-ga-connector/.env
+ExecStart=/opt/mcp-ga-connector/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
