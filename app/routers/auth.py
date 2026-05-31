@@ -84,8 +84,12 @@ async def login(
         session_id = str(uuid.uuid4())
         logger.info(f"Claude OAuth flow: vygenerován session_id={session_id[:8]}... ze state={state[:8]}...")
         
-        # Ulož mapping state → session_id
-        oauth_state = OAuthState(state=state, session_id=session_id)
+        # Ulož mapping: Claude's state → naše session_id
+        # Budeme si pamatovat Claude's original state, aby se při callbacku sladilo
+        oauth_state = OAuthState(
+            state=state,  # Claude's original state
+            session_id=session_id
+        )
         db.add(oauth_state)
         await db.commit()
     
@@ -94,17 +98,21 @@ async def login(
     
     # ---- Spusť Google OAuth flow ----
     flow = create_flow()
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",  # vždy zobrazí dialog, aby dostali refresh_token
-    )
-
-    # Ulož session_id → session_id mapping (pro callback)
-    if not is_claude_oauth:
-        oauth_state = OAuthState(state=secrets.token_urlsafe(32), session_id=session_id)
-        db.add(oauth_state)
-        await db.commit()
+    
+    # Pokud je Claude OAuth, pošli Claude's state do Google aby nám ho vrátil v callbacku
+    if is_claude_oauth:
+        auth_url, _ = flow.authorization_url(
+            state=state,  # Pošli Claude's state dál Googlu — on nám ho vrátí
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+    else:
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
 
     logger.info(f"Redirecting to Google OAuth: session_id={session_id[:8]}...")
     return RedirectResponse(auth_url)
@@ -119,14 +127,16 @@ async def callback(
 ):
     """
     Google přesměruje sem po přihlášení.
+    State je stejný jako v /login (ať je to Claude's state nebo náš).
     """
-    # Ověř state (CSRF)
+    # Ověř state (CSRF protection)
     result = await db.execute(
         select(OAuthState).where(OAuthState.state == state)
     )
     oauth_state = result.scalar_one_or_none()
 
     if not oauth_state:
+        logger.error(f"Callback: state '{state[:20]}...' nenalezen v DB")
         raise HTTPException(status_code=400, detail="Neplatný nebo expirovaný OAuth state")
 
     session_id = oauth_state.session_id
@@ -137,7 +147,11 @@ async def callback(
 
     # Vyměň code za token
     flow = create_flow()
-    flow.fetch_token(code=code)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        logger.error(f"Token exchange failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Token exchange selhalo: {str(e)}")
 
     creds = flow.credentials
     logger.info(f"✅ Google OAuth úspěšný pro session_id={session_id[:8]}...")
