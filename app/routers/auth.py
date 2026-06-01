@@ -1,12 +1,13 @@
 """
 OAuth 2.0 pro Claude Desktop MCP
+Vrací JSON response s mcp_uri
 """
 import logging
 import uuid
-from datetime import datetime, timezone
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from google_auth_oauthlib.flow import Flow
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -55,27 +56,20 @@ async def login(
     scope: str = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    OAuth 2.0 Authorization endpoint pro Claude Desktop.
-    """
+    """OAuth 2.0 Authorization endpoint."""
     
     if not response_type or not client_id or not redirect_uri or not state:
         raise HTTPException(status_code=400, detail="Chybí OAuth parametry")
     
-    logger.info(f"🔐 OAuth /login: state={state[:20]}..., client_id={client_id}")
+    logger.info(f"🔐 OAuth /login: state={state[:20]}...")
     
-    # Ulož mapping: Claude's state → session_id
     session_id = str(uuid.uuid4())
-    oauth_state = OAuthState(
-        state=state,
-        session_id=session_id
-    )
+    oauth_state = OAuthState(state=state, session_id=session_id)
     db.add(oauth_state)
     await db.commit()
     
-    logger.info(f"✅ Created session {session_id[:8]}... for state {state[:8]}...")
+    logger.info(f"✅ Session {session_id[:8]}...")
     
-    # Spusť Google OAuth flow
     flow = create_flow()
     auth_url, _ = flow.authorization_url(
         state=state,
@@ -84,7 +78,8 @@ async def login(
         prompt="consent",
     )
 
-    logger.info(f"Redirecting to Google...")
+    logger.info(f"→ Google OAuth redirect")
+    from fastapi.responses import RedirectResponse
     return RedirectResponse(auth_url)
 
 
@@ -97,28 +92,25 @@ async def callback(
 ):
     """
     Google OAuth callback.
-    Vyměníme code za token a vrátíme HTML s auto-redirect na /sse.
+    VRACÍ JSON RESPONSE s mcp_uri pro Claude Desktop!
     """
     
     if not code or not state:
-        raise HTTPException(status_code=400, detail="Chybí code nebo state")
+        return JSONResponse({"error": "Chybí code nebo state"}, status_code=400)
     
-    logger.info(f"🔄 Callback: state={state[:20]}..., code={code[:20]}...")
+    logger.info(f"🔄 Callback: state={state[:20]}...")
     
-    # Ověř state v DB
     result = await db.execute(
         select(OAuthState).where(OAuthState.state == state)
     )
     oauth_state = result.scalar_one_or_none()
 
     if not oauth_state:
-        logger.error(f"❌ State '{state[:20]}...' nenalezen v DB")
-        raise HTTPException(status_code=400, detail="Neplatný state")
+        logger.error(f"❌ State nenalezen")
+        return JSONResponse({"error": "Neplatný state"}, status_code=400)
 
     session_id = oauth_state.session_id
-    logger.info(f"Found session: {session_id[:8]}...")
-
-    # Smaž použitý state
+    
     await db.execute(delete(OAuthState).where(OAuthState.state == state))
     await db.commit()
 
@@ -127,24 +119,22 @@ async def callback(
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        logger.error(f"❌ Token exchange failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Token exchange selhalo: {str(e)}")
+        logger.error(f"❌ Token exchange failed")
+        return JSONResponse({"error": "Token exchange failed"}, status_code=400)
 
     creds = flow.credentials
     
-    # Dekóduj ID token
     google_email = "unknown"
     try:
         if creds.id_token:
             id_token_decoded = jwt.decode(creds.id_token, options={"verify_signature": False})
             google_email = id_token_decoded.get("email", "unknown")
-            logger.info(f"Email: {google_email}")
     except Exception as e:
-        logger.warning(f"ID token decode failed: {e}")
+        logger.warning(f"ID token decode failed")
     
-    logger.info(f"✅ OAuth successful: email={google_email}")
+    logger.info(f"✅ OAuth OK: {google_email}")
 
-    # Ulož token do DB
+    # Ulož token
     token_row = OAuthToken(
         session_id=session_id,
         google_email=google_email,
@@ -156,18 +146,24 @@ async def callback(
     db.add(token_row)
     await db.commit()
 
-    # ========== CRUCIAL FOR CLAUDE DESKTOP ==========
-    # Vrátíme HTTP 302 Redirect (ne HTML)
+    # ========== KLÍČOVÉ: VRÁTÍME JSON S mcp_uri ==========
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
-    logger.info(f"🎯 Redirecting to MCP URI: {mcp_uri}")
+    logger.info(f"🎯 MCP URI: {mcp_uri}")
     
-    # Vrátíme 302 redirect — Claude Desktop to automaticky sleduje
-    return RedirectResponse(mcp_uri, status_code=302)
+    # Vrátíme JSON response s mcp_uri
+    # Claude Desktop si vezme tuto URL a sám se tam připojí
+    return JSONResponse({
+        "success": True,
+        "mcp_uri": mcp_uri,
+        "session_id": session_id,
+        "email": google_email,
+        "status": "authenticated"
+    })
 
 
 @router.get("/status")
 async def status(session_id: str, db: AsyncSession = Depends(get_db)):
-    """Stav přihlášení pro session."""
+    """Stav přihlášení."""
     result = await db.execute(
         select(OAuthToken).where(
             OAuthToken.session_id == session_id,
