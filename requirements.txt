@@ -10,3 +10,4 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.154.0
 httpx==0.28.0
 python-dotenv==1.0.1
+PyJWT==2.8.1
