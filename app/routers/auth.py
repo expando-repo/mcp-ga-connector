@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -97,7 +97,7 @@ async def callback(
 ):
     """
     Google OAuth callback.
-    Vyměníme code za token a vrátíme redirect na /sse pro Claude Desktop.
+    Vyměníme code za token a vrátíme HTML s auto-redirect na /sse.
     """
     
     if not code or not state:
@@ -156,12 +156,12 @@ async def callback(
     db.add(token_row)
     await db.commit()
 
-    # ========== KRITICKÉ PRO CLAUDE DESKTOP ==========
-    # Vrátíme REDIRECT na /sse endpoint
-    # Claude Desktop uzavře OAuth dialog a sám se připojí k /sse
+    # ========== CRUCIAL FOR CLAUDE DESKTOP ==========
+    # Vrátíme HTTP 302 Redirect (ne HTML)
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
     logger.info(f"🎯 Redirecting to MCP URI: {mcp_uri}")
     
+    # Vrátíme 302 redirect — Claude Desktop to automaticky sleduje
     return RedirectResponse(mcp_uri, status_code=302)
 
 
