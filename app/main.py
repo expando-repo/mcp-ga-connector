@@ -54,7 +54,8 @@ app.add_middleware(
 )
 
 # Registruj routers
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
+# auth router je WITHOUT prefix — /authorize, /callback budou na root
+app.include_router(auth.router, tags=["auth"])
 app.include_router(mcp.router, tags=["mcp"])
 
 
