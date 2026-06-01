@@ -2,14 +2,13 @@
 Google OAuth 2.0 flow + Claude.ai MCP integration
 """
 import json
-import secrets
 import logging
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request as GoogleRequest
@@ -124,7 +123,7 @@ async def callback(
 ):
     """
     Google přesměruje sem po přihlášení.
-    State je stejný jako v /login (ať je to Claude's state nebo náš).
+    Vrací JSON response pro Claude.ai klienta.
     """
     # Ověř state (CSRF protection)
     result = await db.execute(
@@ -134,7 +133,10 @@ async def callback(
 
     if not oauth_state:
         logger.error(f"Callback: state '{state[:20]}...' nenalezen v DB")
-        raise HTTPException(status_code=400, detail="Neplatný nebo expirovaný OAuth state")
+        return JSONResponse(
+            {"success": False, "error": "Neplatný nebo expirovaný OAuth state"},
+            status_code=400
+        )
 
     session_id = oauth_state.session_id
 
@@ -148,7 +150,10 @@ async def callback(
         flow.fetch_token(code=code)
     except Exception as e:
         logger.error(f"Token exchange failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Token exchange selhalo: {str(e)}")
+        return JSONResponse(
+            {"success": False, "error": f"Token exchange selhalo: {str(e)}"},
+            status_code=400
+        )
 
     creds = flow.credentials
     
@@ -180,86 +185,16 @@ async def callback(
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
     logger.info(f"✅ MCP URI: {mcp_uri}")
 
-    # Vrať HTML stránku s Claude deep-link + instrukcemi
-    # Pokud je to v prohlížeči, nabídneme deep-link "Spustit Claude.ai"
-    html_content = f"""
-    <html>
-    <head>
-        <title>MCP GA Connector - OAuth Success</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                max-width: 600px;
-                margin: 50px auto;
-                padding: 20px;
-                text-align: center;
-            }}
-            .success {{ color: #10a37f; font-size: 24px; margin-bottom: 20px; }}
-            .info {{ background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0; }}
-            .mcp-uri {{ 
-                background: #fafafa;
-                padding: 15px;
-                border: 1px solid #ddd;
-                border-radius: 8px;
-                font-family: monospace;
-                word-break: break-all;
-                margin: 20px 0;
-            }}
-            a.button {{
-                display: inline-block;
-                background: #10a37f;
-                color: white;
-                padding: 12px 24px;
-                border-radius: 8px;
-                text-decoration: none;
-                margin: 10px;
-                font-weight: bold;
-            }}
-            a.button:hover {{
-                background: #0d8e73;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="success">✅ OAuth Success!</div>
-        
-        <p><strong>User:</strong> {google_email}</p>
-        <p><strong>Session:</strong> {session_id}</p>
-        
-        <div class="info">
-            <p><strong>Tvůj MCP endpoint je připravený!</strong></p>
-            <p>Snaž se nyní spustit Claude.ai a zkontrolovat GA Connector status.</p>
-        </div>
-        
-        <p>Nebo klikni na tlačítko níže pro otevření Claude.ai:</p>
-        
-        <a href="claude://app" class="button">📱 Spustit Claude.ai</a>
-        
-        <div class="info">
-            <p><strong>MCP URI:</strong></p>
-            <div class="mcp-uri">{mcp_uri}</div>
-            <p style="font-size: 12px; color: #666;">Pokud se Claude.ai neotevře, zkopíruj tuto URL a přidej ji do Claude connector settings.</p>
-        </div>
-        
-        <script>
-        // Automaticky přesměruj po 2 sekundách
-        setTimeout(function() {{
-            // Pokus se otevřít Claude.ai deep link
-            window.location.href = 'claude://app';
-            
-            // Fallback - zobrazení instrukce
-            setTimeout(function() {{
-                alert('Claude.ai se nepodařilo otevřít. Prosím spusť Claude.ai ručně v aplikaci.');
-            }}, 1000);
-        }}, 1000);
-        </script>
-    </body>
-    </html>
-    """
-    
-    return HTMLResponse(html_content)
+    # Vrať JSON response s MCP info pro Claude.ai
+    # Claude.ai parsuje toto a pozná že je to success
+    return JSONResponse({
+        "success": True,
+        "status": "authenticated",
+        "session_id": session_id,
+        "email": google_email,
+        "mcp_uri": mcp_uri,
+        "message": "OAuth authentication successful. You can now use the GA Connector in Claude.ai"
+    })
 
 
 @router.get("/status")
