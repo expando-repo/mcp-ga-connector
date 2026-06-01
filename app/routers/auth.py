@@ -1,14 +1,11 @@
 """
 OAuth 2.0 pro Claude Desktop MCP
-Vrací JSON na Claude's redirect_uri endpoint
 """
 import logging
 import uuid
-import json
-import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -45,8 +42,8 @@ def create_flow() -> Flow:
     )
 
 
-@router.get("/login")
-async def login(
+@router.get("/authorize")
+async def authorize(
     request: Request,
     response_type: str = Query(None),
     client_id: str = Query(None),
@@ -57,23 +54,25 @@ async def login(
     scope: str = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """OAuth 2.0 Authorization endpoint."""
+    """
+    OAuth 2.0 Authorization endpoint (standardní /authorize, ne /login).
+    Claude Desktop volá tento endpoint.
+    """
     
     if not response_type or not client_id or not redirect_uri or not state:
         raise HTTPException(status_code=400, detail="Chybí OAuth parametry")
     
-    logger.info(f"🔐 OAuth /login: state={state[:20]}..., redirect_uri={redirect_uri[:50]}...")
+    logger.info(f"🔐 OAuth /authorize: state={state[:20]}...")
     
+    # Ulož mapping
     session_id = str(uuid.uuid4())
-    oauth_state = OAuthState(
-        state=state,
-        session_id=session_id
-    )
+    oauth_state = OAuthState(state=state, session_id=session_id)
     db.add(oauth_state)
     await db.commit()
     
     logger.info(f"✅ Session {session_id[:8]}...")
     
+    # Google OAuth
     flow = create_flow()
     auth_url, _ = flow.authorization_url(
         state=state,
@@ -82,8 +81,7 @@ async def login(
         prompt="consent",
     )
 
-    logger.info(f"→ Google OAuth redirect")
-    from fastapi.responses import RedirectResponse
+    logger.info(f"→ Google OAuth")
     return RedirectResponse(auth_url)
 
 
@@ -94,17 +92,14 @@ async def callback(
     state: str = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Google OAuth callback.
-    VRACÍ JSON NA CLAUDE'S redirect_uri ENDPOINT!
-    """
+    """Google OAuth callback → vrací JSON s mcp_uri."""
     
     if not code or not state:
         return JSONResponse({"error": "Chybí code nebo state"}, status_code=400)
     
     logger.info(f"🔄 Callback: state={state[:20]}...")
     
-    # Najdi session z state
+    # Najdi session
     result = await db.execute(
         select(OAuthState).where(OAuthState.state == state)
     )
@@ -124,11 +119,12 @@ async def callback(
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        logger.error(f"❌ Token exchange failed: {e}")
+        logger.error(f"❌ Token exchange failed")
         return JSONResponse({"error": "Token exchange failed"}, status_code=400)
 
     creds = flow.credentials
     
+    # Dekóduj email
     google_email = "unknown"
     try:
         if creds.id_token:
@@ -155,18 +151,13 @@ async def callback(
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
     logger.info(f"🎯 MCP URI: {mcp_uri}")
     
-    # ========== KRITICKÉ: VRÁTÍMEただし SIMPLU JSON ==========
-    # Claude Desktop si vezme tuto JSON a sám si jí zpracuje
-    # Nemusíme ji posílat na redirect_uri - Claude si ji vezme tady
-    response = {
+    # Vrátíme JSON s mcp_uri
+    return JSONResponse({
         "success": True,
         "mcp_uri": mcp_uri,
         "session_id": session_id,
         "email": google_email,
-    }
-    
-    logger.info(f"Returning JSON response: {response}")
-    return JSONResponse(response)
+    })
 
 
 @router.get("/status")
