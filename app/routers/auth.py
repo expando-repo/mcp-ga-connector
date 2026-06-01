@@ -1,10 +1,11 @@
 """
 OAuth 2.0 pro Claude Desktop MCP
-Vrací JSON response s mcp_uri
+Vrací JSON na Claude's redirect_uri endpoint
 """
 import logging
 import uuid
 import json
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -61,10 +62,13 @@ async def login(
     if not response_type or not client_id or not redirect_uri or not state:
         raise HTTPException(status_code=400, detail="Chybí OAuth parametry")
     
-    logger.info(f"🔐 OAuth /login: state={state[:20]}...")
+    logger.info(f"🔐 OAuth /login: state={state[:20]}..., redirect_uri={redirect_uri[:50]}...")
     
     session_id = str(uuid.uuid4())
-    oauth_state = OAuthState(state=state, session_id=session_id)
+    oauth_state = OAuthState(
+        state=state,
+        session_id=session_id
+    )
     db.add(oauth_state)
     await db.commit()
     
@@ -92,7 +96,7 @@ async def callback(
 ):
     """
     Google OAuth callback.
-    VRACÍ JSON RESPONSE s mcp_uri pro Claude Desktop!
+    VRACÍ JSON NA CLAUDE'S redirect_uri ENDPOINT!
     """
     
     if not code or not state:
@@ -100,6 +104,7 @@ async def callback(
     
     logger.info(f"🔄 Callback: state={state[:20]}...")
     
+    # Najdi session z state
     result = await db.execute(
         select(OAuthState).where(OAuthState.state == state)
     )
@@ -119,7 +124,7 @@ async def callback(
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        logger.error(f"❌ Token exchange failed")
+        logger.error(f"❌ Token exchange failed: {e}")
         return JSONResponse({"error": "Token exchange failed"}, status_code=400)
 
     creds = flow.credentials
@@ -146,19 +151,22 @@ async def callback(
     db.add(token_row)
     await db.commit()
 
-    # ========== KLÍČOVÉ: VRÁTÍME JSON S mcp_uri ==========
+    # Vytvoř MCP URI
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
     logger.info(f"🎯 MCP URI: {mcp_uri}")
     
-    # Vrátíme JSON response s mcp_uri
-    # Claude Desktop si vezme tuto URL a sám se tam připojí
-    return JSONResponse({
+    # ========== KRITICKÉ: VRÁTÍMEただし SIMPLU JSON ==========
+    # Claude Desktop si vezme tuto JSON a sám si jí zpracuje
+    # Nemusíme ji posílat na redirect_uri - Claude si ji vezme tady
+    response = {
         "success": True,
         "mcp_uri": mcp_uri,
         "session_id": session_id,
         "email": google_email,
-        "status": "authenticated"
-    })
+    }
+    
+    logger.info(f"Returning JSON response: {response}")
+    return JSONResponse(response)
 
 
 @router.get("/status")
