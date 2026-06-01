@@ -1,17 +1,13 @@
 """
-OAuth 2.0 Authorization Server pro Claude.ai MCP
+OAuth 2.0 pro Claude Desktop MCP
 """
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import JSONResponse, RedirectResponse
-from google.oauth2.credentials import Credentials
+from fastapi.responses import RedirectResponse, JSONResponse
 from google_auth_oauthlib.flow import Flow
-from google.auth.transport.requests import Request as GoogleRequest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 import jwt
@@ -60,21 +56,15 @@ async def login(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    OAuth 2.0 Authorization endpoint (Claude.ai OAuth server).
-    
-    Claude.ai POST-uje sem s OAuth parametry, my jsme Authorization Server.
-    My si pak sami spustíme Google OAuth flow pro user.
+    OAuth 2.0 Authorization endpoint pro Claude Desktop.
     """
     
     if not response_type or not client_id or not redirect_uri or not state:
         raise HTTPException(status_code=400, detail="Chybí OAuth parametry")
     
-    # Zkontroluj že client_id je legitimní (claude.ai)
-    # V produkci bys měl seznam povolených client_ids
+    logger.info(f"🔐 OAuth /login: state={state[:20]}..., client_id={client_id}")
     
-    logger.info(f"OAuth /login: state={state[:20]}..., redirect_uri={redirect_uri}")
-    
-    # Ulož mapping: Claude's state + redirect_uri → session_id
+    # Ulož mapping: Claude's state → session_id
     session_id = str(uuid.uuid4())
     oauth_state = OAuthState(
         state=state,
@@ -83,12 +73,10 @@ async def login(
     db.add(oauth_state)
     await db.commit()
     
-    logger.info(f"Created session {session_id[:8]}... for Claude state {state[:8]}...")
+    logger.info(f"✅ Created session {session_id[:8]}... for state {state[:8]}...")
     
     # Spusť Google OAuth flow
     flow = create_flow()
-    
-    # Pošli Claude's state do Google aby nám ho vrátil v callbacku
     auth_url, _ = flow.authorization_url(
         state=state,
         access_type="offline",
@@ -96,7 +84,7 @@ async def login(
         prompt="consent",
     )
 
-    logger.info(f"Redirecting to Google: {auth_url[:100]}...")
+    logger.info(f"Redirecting to Google...")
     return RedirectResponse(auth_url)
 
 
@@ -109,11 +97,13 @@ async def callback(
 ):
     """
     Google OAuth callback.
-    Vyměníme code za token a vrátíme JSON do Claude.ai callback URL.
+    Vyměníme code za token a vrátíme redirect na /sse pro Claude Desktop.
     """
     
     if not code or not state:
         raise HTTPException(status_code=400, detail="Chybí code nebo state")
+    
+    logger.info(f"🔄 Callback: state={state[:20]}..., code={code[:20]}...")
     
     # Ověř state v DB
     result = await db.execute(
@@ -122,11 +112,11 @@ async def callback(
     oauth_state = result.scalar_one_or_none()
 
     if not oauth_state:
-        logger.error(f"Callback: state '{state[:20]}...' nenalezen v DB")
-        # Vrátíme error, ale ne do naší app - to nemůžeme, jsme jen callback
+        logger.error(f"❌ State '{state[:20]}...' nenalezen v DB")
         raise HTTPException(status_code=400, detail="Neplatný state")
 
     session_id = oauth_state.session_id
+    logger.info(f"Found session: {session_id[:8]}...")
 
     # Smaž použitý state
     await db.execute(delete(OAuthState).where(OAuthState.state == state))
@@ -137,8 +127,8 @@ async def callback(
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        logger.error(f"Token exchange failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Token exchange selhalo")
+        logger.error(f"❌ Token exchange failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Token exchange selhalo: {str(e)}")
 
     creds = flow.credentials
     
@@ -148,10 +138,11 @@ async def callback(
         if creds.id_token:
             id_token_decoded = jwt.decode(creds.id_token, options={"verify_signature": False})
             google_email = id_token_decoded.get("email", "unknown")
+            logger.info(f"Email: {google_email}")
     except Exception as e:
         logger.warning(f"ID token decode failed: {e}")
     
-    logger.info(f"✅ OAuth successful: session={session_id[:8]}..., email={google_email}")
+    logger.info(f"✅ OAuth successful: email={google_email}")
 
     # Ulož token do DB
     token_row = OAuthToken(
@@ -165,54 +156,13 @@ async def callback(
     db.add(token_row)
     await db.commit()
 
-    # Vytvoř MCP URI
+    # ========== KRITICKÉ PRO CLAUDE DESKTOP ==========
+    # Vrátíme REDIRECT na /sse endpoint
+    # Claude Desktop uzavře OAuth dialog a sám se připojí k /sse
     mcp_uri = f"{settings.base_url}/sse?session_id={session_id}"
-    logger.info(f"MCP URI: {mcp_uri}")
-
-    # ========== KEY CHANGE ==========
-    # Vrátíme HTML stránku, která si vezme state z URL a pošle JSON do Claude.ai
-    # Claude.ai se připojí přes window.opener.postMessage nebo fetch
+    logger.info(f"🎯 Redirecting to MCP URI: {mcp_uri}")
     
-    html_content = f"""
-    <html>
-    <head>
-        <title>GA Connector - OAuth Success</title>
-        <meta charset="utf-8">
-    </head>
-    <body>
-        <h1>✅ Authentication Successful!</h1>
-        <p>Closing this window...</p>
-        
-        <script>
-        // Pokud jsme otevřeni v pop-up (z Claude.ai), pošleme data zpět
-        if (window.opener) {{
-            window.opener.postMessage({{
-                type: 'oauth_success',
-                state: '{state}',
-                session_id: '{session_id}',
-                email: '{google_email}',
-                mcp_uri: '{mcp_uri}'
-            }}, '*');
-            
-            // Zavři toto okno
-            window.close();
-        }} else {{
-            // Pokud to není pop-up, pošleme JSON přímou redirectem (fallback)
-            // Ale to Claude.ai neočekává, takže to nebude fungovat
-            document.body.innerHTML = '<pre>' + JSON.stringify({{
-                state: '{state}',
-                session_id: '{session_id}',
-                email: '{google_email}',
-                mcp_uri: '{mcp_uri}'
-            }}, null, 2) + '</pre>';
-        }}
-        </script>
-    </body>
-    </html>
-    """
-    
-    from fastapi.responses import HTMLResponse
-    return HTMLResponse(html_content)
+    return RedirectResponse(mcp_uri, status_code=302)
 
 
 @router.get("/status")
