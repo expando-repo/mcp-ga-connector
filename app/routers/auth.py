@@ -2,7 +2,13 @@
 OAuth 2.0 pro Claude Desktop MCP
 """
 import logging
+import os
 import uuid
+
+# Google při include_granted_scopes vrací i dříve udělené scope (např. userinfo.profile),
+# takže vrácený scope nesouhlasí s požadovaným. Bez tohoto by oauthlib ve fetch_token()
+# vyhodil "Scope has changed" a výměna tokenu selže. Musí být nastaveno před importem oauthlib.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -120,16 +126,13 @@ async def callback(
         return JSONResponse({"error": "Neplatný state"}, status_code=400)
 
     session_id = oauth_state.session_id
-    
-    await db.execute(delete(OAuthState).where(OAuthState.state == state))
-    await db.commit()
 
     # Vyměň code za token
     flow = create_flow()
     try:
         flow.fetch_token(code=code)
     except Exception as e:
-        logger.error(f"❌ Token exchange failed")
+        logger.error(f"❌ Token exchange failed: {type(e).__name__}: {e}", exc_info=True)
         return JSONResponse({"error": "Token exchange failed"}, status_code=400)
 
     creds = flow.credentials
@@ -155,6 +158,8 @@ async def callback(
         is_active=True,
     )
     db.add(token_row)
+    # Smaž state až po úspěšném uložení tokenu (umožní bezpečné opakování při selhání).
+    await db.execute(delete(OAuthState).where(OAuthState.state == state))
     await db.commit()
 
     # Vytvoř MCP URI
