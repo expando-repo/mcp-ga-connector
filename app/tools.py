@@ -25,9 +25,10 @@ def _build_credentials(creds_dict: dict) -> Credentials:
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
         scopes=creds_dict.get("scopes", []),
+        expiry=creds_dict.get("token_expiry"),
     )
 
-    # Refresh pokud expiroval
+    # Refresh pokud expiroval (expiry je naive UTC datetime, jak ho vrací Google).
     if creds.expired and creds.refresh_token:
         creds.refresh(GoogleRequest())
 

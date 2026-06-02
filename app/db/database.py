@@ -1,5 +1,11 @@
 """
-PostgreSQL databáze - ukládání OAuth tokenů per uživatel
+PostgreSQL databáze - ukládání OAuth tokenů per uživatel a OAuth 2.1 stavu.
+
+Dvě vrstvy OAuth:
+- Claude ↔ náš server: jsme Authorization Server (tabulky oauth_clients, auth_codes,
+  oauth_states drží Claude auth-request během Google round-tripu).
+- náš server ↔ Google: jsme klient (tabulka oauth_tokens drží Google credentials,
+  klíčem je session_id).
 """
 import json
 from datetime import datetime
@@ -19,8 +25,8 @@ class Base(DeclarativeBase):
 
 class OAuthToken(Base):
     """
-    Uložené OAuth tokeny pro každého uživatele.
-    session_id = náhodné ID přiřazené klientovi při OAuth flow
+    Uložené Google OAuth tokeny pro každou session.
+    session_id = náhodné ID přiřazené serverem při OAuth flow (UUID).
     """
     __tablename__ = "oauth_tokens"
 
@@ -39,18 +45,68 @@ class OAuthToken(Base):
             "token": self.access_token,
             "refresh_token": self.refresh_token,
             "token_uri": "https://oauth2.googleapis.com/token",
+            "token_expiry": self.token_expiry,
             "scopes": json.loads(self.scopes) if self.scopes else [],
         }
 
 
 class OAuthState(Base):
     """
-    Dočasný stav během OAuth flow (CSRF ochrana)
+    Dočasný stav během Google OAuth round-tripu (CSRF ochrana).
+
+    Drží zároveň původní Claude auth-request, aby ho `/callback` mohl po návratu
+    z Googlu dokončit (vydat náš authorization code a přesměrovat na Claude).
     """
     __tablename__ = "oauth_states"
 
-    state = Column(String(128), primary_key=True)
+    state = Column(String(128), primary_key=True)  # state, který posíláme Googlu
     session_id = Column(String(64), nullable=False)
+
+    # Původní OAuth request od Claude (vrstva Claude ↔ náš server)
+    client_id = Column(String(128), nullable=True)
+    claude_redirect_uri = Column(Text, nullable=True)
+    claude_state = Column(Text, nullable=True)
+    code_challenge = Column(Text, nullable=True)
+    code_challenge_method = Column(String(16), nullable=True)
+    resource = Column(Text, nullable=True)
+    scope = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OAuthClient(Base):
+    """
+    Klient zaregistrovaný přes Dynamic Client Registration (RFC 7591).
+    Typicky Claude.ai – uloží si sem svoje redirect_uris.
+    """
+    __tablename__ = "oauth_clients"
+
+    client_id = Column(String(128), primary_key=True)
+    client_secret = Column(String(255), nullable=True)  # public client → None
+    redirect_uris = Column(Text, nullable=False)  # JSON list
+    client_name = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def redirect_uri_list(self) -> list[str]:
+        return json.loads(self.redirect_uris) if self.redirect_uris else []
+
+
+class AuthCode(Base):
+    """
+    Krátkodobý authorization code, který vydáváme my Claudovi (vrstva Claude ↔ náš server).
+    Claude ho na `/token` vymění za náš JWT access token. PKCE se ověřuje proti code_challenge.
+    """
+    __tablename__ = "auth_codes"
+
+    code = Column(String(128), primary_key=True)
+    session_id = Column(String(64), nullable=False)  # mapuje na OAuthToken (Google creds)
+    client_id = Column(String(128), nullable=True)
+    redirect_uri = Column(Text, nullable=True)
+    code_challenge = Column(Text, nullable=True)
+    code_challenge_method = Column(String(16), nullable=True)
+    resource = Column(Text, nullable=True)
+    scope = Column(Text, nullable=True)
+    expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

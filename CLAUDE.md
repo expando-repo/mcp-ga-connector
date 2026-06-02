@@ -34,21 +34,34 @@ V repu **nejsou testy, linter ani build krok**. `DEPLOY.md` je kompletní produk
 ## Architektura
 
 ```
-claude.ai ←HTTPS/SSE→ Nginx ←→ uvicorn (app.main:app) ←→ Google Analytics API
-                                      ↓
-                                 PostgreSQL (OAuth tokeny, klíčem je session_id)
+claude.ai ←HTTPS→ Nginx ←→ uvicorn (app.main:app) ←→ Google Analytics API
+   (OAuth 2.1,                    ↓
+    Bearer JWT)            PostgreSQL (Google tokeny + OAuth 2.1 stav)
 ```
 
-- **`app/main.py`** — skutečná FastAPI aplikace (na ni odkazuje `Dockerfile` i `deploy/mcp-ga-connector.service`).
-- **`app/routers/auth.py`** — Google OAuth flow. `/authorize` (zahájí Claude) → Google →
-  `/callback` (vymění code, uloží token, vrátí `mcp_uri` s vygenerovaným `session_id`).
-  Dále `/status` a `/disconnect`. CSRF `state` se během round-tripu ukládá do tabulky `oauth_states`.
-- **`app/routers/mcp.py`** — MCP transport. `GET /sse` otevře Server-Sent-Events stream (pošle MCP
-  handshake + `tools/list`, pak vyprazdňuje per-session `asyncio.Queue` s keepalive pingem á 30 s).
-  `POST /message?session_id=...` přijme JSON-RPC `tools/call`, spustí nástroj a vloží odpověď do
-  fronty dané session. **Fronty zpráv jsou v paměti procesu** (`_message_queues` dict), takže
-  nasazení s více workery/procesy rozbije doručování SSE zpráv — systemd unit běží s `--workers 2`,
-  což je skrytá chyba.
+**Dvě vrstvy OAuth.** Server je vůči Claudovi plnohodnotný **OAuth 2.1 Authorization Server**
+(Claude je klient, dostává náš vlastní JWT), a zároveň je **klientem vůči Googlu** (deleguje login,
+ukládá GA credentials). To jsou dva nezávislé tokeny: náš JWT v sobě nese `session_id` (claim `sub`),
+podle kterého Resource Server dohledá Google credentials v `oauth_tokens`.
+
+Tok: `Claude →/authorize→ náš server →redirect→ Google →/callback→ náš server (uloží GA creds,
+vydá náš code) →redirect→ Claude →/token→ náš JWT →/mcp (Bearer)→ nástroje`.
+
+- **`app/main.py`** — FastAPI aplikace (na ni odkazuje `Dockerfile` i `deploy/mcp-ga-connector.service`).
+- **`app/oauth_server.py`** — OAuth 2.1 helpery: mint/verify JWT access+refresh tokenů (HS256 přes
+  `SECRET_KEY`), PKCE S256 ověření, discovery dokumenty (RFC 8414 / RFC 9728). Kanonická resource
+  URI je `{base_url}/mcp`, issuer je `{base_url}`.
+- **`app/routers/auth.py`** — Authorization Server. Discovery (`/.well-known/oauth-protected-resource`,
+  `/.well-known/oauth-authorization-server`), Dynamic Client Registration `POST /register` (RFC 7591),
+  `GET /authorize` (uloží Claude auth-request do `oauth_states` a deleguje na Google),
+  `GET /callback` (vymění Google code, uloží GA creds pod `session_id`, vydá náš `auth_code`,
+  přesměruje zpět na Claudovo `redirect_uri`), `POST /token` (granty `authorization_code` s PKCE
+  a `refresh_token`, vydává JWT). Tělo se parsuje ručně (`_parse_body`) — bez `python-multipart`.
+- **`app/routers/mcp.py`** — MCP transport **Streamable HTTP** (spec 2025-06-18). Jediný endpoint
+  `POST /mcp` přijímá JSON-RPC (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
+  `ping`) a odpovídá `application/json`. **Stateless** — identitu nese `Authorization: Bearer <JWT>`,
+  žádné in-memory fronty, takže `--workers 2` je v pořádku. Chybějící/nevalidní token → `401` s
+  `WWW-Authenticate: Bearer resource_metadata=...`. `GET /mcp` → `405` (server nenabízí push stream).
 - **`app/tools.py`** — pět GA nástrojů (`get_account_summaries`, `get_property_details`,
   `run_report`, `run_realtime_report`, `get_custom_dimensions_and_metrics`). Synchronní volání
   Google API klienta jsou obalena v `run_in_executor`. `get_tools_definition()` vrací MCP schéma,
@@ -60,27 +73,27 @@ claude.ai ←HTTPS/SSE→ Nginx ←→ uvicorn (app.main:app) ←→ Google Anal
   `google_client_secret`, `base_url`, `secret_key`, `database_url` jsou **povinné**; bez nich se
   aplikace nespustí.
 
-Identitou pro auth je serverem vygenerovaný `session_id` (UUID) uložený jako PK tabulky
-`oauth_tokens`; protéká OAuth callbackem do MCP URI a vyžadují ho oba endpointy `/sse` i `/message`.
+Identitou pro auth je serverem vygenerovaný `session_id` (UUID), klíč tabulky `oauth_tokens`
+(Google creds). Vůči Claudovi se ven nese **náš JWT** s tímto `session_id` v claimu `sub`.
 
-## Důležité: drift mezi moduly / známé nekonzistence
+## DB tabulky
 
-Repo aktuálně obsahuje **dvě konkurenční kopie** wiringu aplikace. Při změnách pracuj proti `app/`
-(nasazený kód) a měj na paměti, že si vzájemně odporují:
+- **`oauth_tokens`** — Google credentials per `session_id` (access/refresh token, expiry, scopes).
+- **`oauth_states`** — dočasný stav během Google round-tripu; drží i původní Claude auth-request
+  (`client_id`, `claude_redirect_uri`, `claude_state`, `code_challenge`, `resource`, `scope`).
+- **`oauth_clients`** — klienti zaregistrovaní přes DCR (jejich `redirect_uris`).
+- **`auth_codes`** — krátkodobé (5 min) authorization codes, které vydáváme Claudovi; single-use,
+  ověřují se proti PKCE `code_challenge`.
 
-1. **`/main.py` (kořen repa) je mrtvý/legacy** — mountuje auth router pod prefix `/auth` a importuje
-   `init_db`/`get_db` jinak. Nic ho nenasazuje. Živý entry point je `app.main:app`. Poslední commit
-   "Remove /auth prefix" se týkal `app/main.py`, který teď mountuje auth na **root** (`/authorize`, `/callback`).
+Tabulky se vytvoří automaticky při startu (`Base.metadata.create_all`, žádné migrace).
 
-Při opravě se rozhodni pro jeden app modul, místo záplatování okolo té divergence.
+## Důležité: konfigurace a kompatibilita
 
-OAuth cesty jsou sjednocené na root mounting (žádný `/auth` prefix): `/authorize`, `/callback`,
-`/status`, `/disconnect`. `redirect_uri` míří na `{base_url}/callback` — **musí přesně odpovídat
-Authorized redirect URI v Google Cloud Console** (po této změně je tam potřeba `/callback`, ne
-`/auth/callback`). `/authorize` zvládá jak volání OAuth klientem (Claude Desktop s plnými parametry),
-tak holé přesměrování z `/sse` jen se `session_id`.
-
-> Poznámka: `OAuthToken.scopes` ani `token_expiry` se v `/callback` neukládají, takže
-> `get_credentials_dict()` vrací prázdné `scopes` a `_build_credentials` nezná expiraci — proaktivní
-> refresh se tím pádem nespustí (refresh proběhne až když Google API vrátí 401). Funkční to je,
-> ale stojí za pozdější dořešení.
+- **Google redirect_uri** je `{base_url}/callback` — musí přesně odpovídat Authorized redirect URI
+  v Google Cloud Console.
+- **MCP URL pro Claude konektor** je `{base_url}/mcp` (ne kořen, ne `/sse`).
+- `OAUTHLIB_RELAX_TOKEN_SCOPE=1` se nastavuje v `auth.py` před importem oauthlib — Google přes
+  `include_granted_scopes` vrací širší scope, než žádáme (např. `userinfo.profile`), což by jinak
+  shodilo `fetch_token()` s „Scope has changed".
+- `OAuthToken.scopes` i `token_expiry` se v `/callback` ukládají a `_build_credentials` z nich
+  staví `Credentials` s `expiry`, takže proaktivní refresh Google tokenu funguje.
