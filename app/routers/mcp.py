@@ -107,7 +107,7 @@ async def sse_endpoint(
     if not token:
         logger.info(f"Session {session_id[:8]}... není přihlášená, přesměrování na OAuth login")
         from fastapi.responses import RedirectResponse
-        redirect_url = f"{settings.base_url}/auth/login?session_id={session_id}"
+        redirect_url = f"{settings.base_url}/authorize?session_id={session_id}"
         return RedirectResponse(redirect_url)
 
     logger.info(f"✅ SSE stream otevřen pro session {session_id[:8]}... (email: {token.google_email})")
@@ -166,10 +166,8 @@ async def message_endpoint(
         try:
             result = await handle_tool_call(
                 tool_name=tool_name,
-                arguments=tool_args,
-                session_id=session_id,
-                google_email=token.google_email,
-                access_token=token.access_token,
+                args=tool_args,
+                credentials_dict=token.get_credentials_dict(),
             )
 
             response = {

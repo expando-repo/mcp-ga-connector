@@ -27,7 +27,7 @@ CLIENT_CONFIG = {
     "web": {
         "client_id": settings.google_client_id,
         "client_secret": settings.google_client_secret,
-        "redirect_uris": [f"{settings.base_url}/auth/callback"],
+        "redirect_uris": [f"{settings.base_url}/callback"],
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
     }
@@ -38,7 +38,7 @@ def create_flow() -> Flow:
     return Flow.from_client_config(
         CLIENT_CONFIG,
         scopes=SCOPES,
-        redirect_uri=f"{settings.base_url}/auth/callback",
+        redirect_uri=f"{settings.base_url}/callback",
     )
 
 
@@ -52,20 +52,30 @@ async def authorize(
     code_challenge_method: str = Query(None),
     state: str = Query(None),
     scope: str = Query(None),
+    session_id: str = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
     OAuth 2.0 Authorization endpoint (standardní /authorize, ne /login).
-    Claude Desktop volá tento endpoint.
+
+    Dva způsoby volání:
+    - Klient (Claude Desktop) volá s OAuth parametry včetně vlastního `state`.
+    - Přesměrování z `/sse` u nepřihlášené session volá jen se `session_id`.
+    V obou případech zahájíme Google OAuth a do `oauth_states` uložíme mapping
+    state → session_id, aby ho `/callback` našel.
     """
-    
-    if not response_type or not client_id or not redirect_uri or not state:
-        raise HTTPException(status_code=400, detail="Chybí OAuth parametry")
-    
-    logger.info(f"🔐 OAuth /authorize: state={state[:20]}...")
-    
+
+    # state: použij ten od OAuth klienta, jinak si vygeneruj vlastní
+    if not state:
+        state = uuid.uuid4().hex
+
+    # session_id: použij předané z /sse, jinak vytvoř nové
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    logger.info(f"🔐 OAuth /authorize: state={state[:20]}... session={session_id[:8]}...")
+
     # Ulož mapping
-    session_id = str(uuid.uuid4())
     oauth_state = OAuthState(state=state, session_id=session_id)
     db.add(oauth_state)
     await db.commit()

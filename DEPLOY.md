@@ -46,7 +46,7 @@ claude.ai ←→ HTTPS/SSE ←→ Nginx ←→ FastAPI (uvicorn) ←→ Google A
 3. Name: `MCP GA Connector`
 4. Authorized redirect URIs:
    ```
-   https://mcp.vasedomena.cz/auth/callback
+   https://mcp.vasedomena.cz/callback
    ```
 5. Ulož `Client ID` a `Client Secret` — budeš je potřebovat
 
@@ -233,7 +233,7 @@ ORDER BY created_at DESC;
 
 ### Odpojení klienta
 ```bash
-curl "https://mcp.vasedomena.cz/auth/disconnect?session_id=SESSION_ID"
+curl "https://mcp.vasedomena.cz/disconnect?session_id=SESSION_ID"
 ```
 
 ---
@@ -242,7 +242,7 @@ curl "https://mcp.vasedomena.cz/auth/disconnect?session_id=SESSION_ID"
 
 | Problém | Řešení |
 |---------|--------|
-| `401 Nepřihlášen` | Klient musí nejdřív navštívit `/auth/login?session_id=...` |
+| `401 Nepřihlášen` | Klient musí nejdřív projít OAuth na `/authorize?session_id=...` |
 | SSE se odpojuje | Zkontroluj nginx `proxy_read_timeout` — musí být 3600s |
 | `Token expired` | Refresh token funguje automaticky, pokud je uložen |
 | GA API 403 | Zkontroluj, zda jsou povoleny oba GA API v Google Cloud |
